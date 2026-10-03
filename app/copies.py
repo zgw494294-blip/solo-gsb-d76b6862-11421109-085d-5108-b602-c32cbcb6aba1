@@ -43,6 +43,17 @@ label），初始**无人持有**。
 `get_revision` 的批注按**该版保存的原序**（`pos`，即创建顺序）返回——
 已存历史与旧库 baseline 同样适用，且只改读取、不回写历史数据；当前副本
 的创建 / 读取 / 变更响应仍按 (start, end, label, id) 稳定排序。
+
+**版本间改动比较（只读）**：`diff_revisions` 取两个**已记录版本**的快照
+（`from_revision`、`to_revision` 均为正整数，允许倒序、允许相同），按批注
+**完整字符串 id 对齐**（不按数组位置配对，空串、斜杠、换行 id 原样参与），
+逐条比较 `start`、`end`、`label`、`holder` 四个字段，**仅列出至少一个字段
+变化的批注**：每条给出四字段各自的旧值 / 新值（方向按入参 from → to 确定）
+与变化字段名，结果按 id 的 **Unicode 码点序**排列；**纯顺序变化不算改动**。
+另返回两端 `status`——结稿只翻 `status`、批注未变时清单为空，相同版本比较
+同样为空清单。比较**只读已存快照**：不读取当前状态补值、不改副本与历史；
+未知副本或任一版本未记录（旧库仅有 baseline 时不推测缺失历史）分别抛
+`CopyNotFound` / `RevisionNotFound`（对应 HTTP 404）。
 """
 
 from __future__ import annotations
@@ -228,6 +239,41 @@ def connected_groups(annotations: list[dict]) -> list[list[str]]:
 
 
 # ---------- 纯内存核心 ----------
+
+
+# 比较只看这四个字段（按此规范顺序列出变化字段名）；纯顺序变化不在其中。
+DIFF_FIELDS: tuple[str, ...] = ("start", "end", "label", "holder")
+
+
+def diff_annotations(from_snap: dict, to_snap: dict) -> list[dict]:
+    """比较两个版本快照中四字段（start/end/label/holder）的逐批注差异。
+
+    按批注**完整字符串 id 对齐**（dict 键，不按数组位置配对，空串、斜杠、
+    换行 id 原样参与），因此快照保存顺序不同（纯顺序变化）不算改动；只返回
+    至少一个字段变化的批注：每条给出 ``id``、``changed_fields``（变化字段
+    名，按 DIFF_FIELDS 顺序）与四字段各自的 ``old`` / ``new``（方向由
+    from → to 入参确定）。结果按 id 的 **Unicode 码点序**（Python 字符串
+    默认序）排列。快照批注集合在领域上恒定（修改不增删批注）；理论上仅在
+    一侧出现的 id 缺失侧按 ``None`` 处理，且不会伪造其余字段。
+    """
+    from_by_id = {a["id"]: a for a in from_snap["annotations"]}
+    to_by_id = {a["id"]: a for a in to_snap["annotations"]}
+    changes = []
+    for ann_id in sorted(set(from_by_id) | set(to_by_id)):
+        old = from_by_id.get(ann_id)
+        new = to_by_id.get(ann_id)
+        fields = {}
+        changed = []
+        for field in DIFF_FIELDS:
+            old_value = None if old is None else old[field]
+            new_value = None if new is None else new[field]
+            fields[field] = {"old": old_value, "new": new_value}
+            if old_value != new_value:
+                changed.append(field)
+        if changed:
+            changes.append({"id": ann_id, "changed_fields": changed,
+                            **fields})
+    return changes
 
 
 class CopyState:
@@ -691,5 +737,56 @@ class CopyStore:
                 snap["op"] = op
                 snap["reviewer"] = reviewer
                 return snap
+            finally:
+                conn.close()
+
+    def diff_revisions(self, copy_id: str,
+                       from_revision: int, to_revision: int) -> dict:
+        """比较两个**已记录版本**快照间的批注改动（只读，不改变任何状态）。
+
+        只读取历史快照表（不读取当前副本状态补值）；按完整字符串 id 对齐
+        比较 start/end/label/holder（纯顺序变化不算改动），另返回两端
+        revision 与 status。方向按入参 from → to 确定（允许倒序、相同）。
+        未知副本抛 ``CopyNotFound``、任一版本未记录抛 ``RevisionNotFound``
+        （旧库仅有 baseline 时不推测缺失历史；均对应 HTTP 404）。
+        """
+        with self._lock:
+            conn = self._connect()
+            try:
+                if conn.execute("SELECT 1 FROM copies WHERE id=?",
+                                (copy_id,)).fetchone() is None:
+                    raise CopyNotFound(copy_id)
+
+                def load(revision: int) -> dict:
+                    # 字段全部来自该版已存快照；不查当前 annotations 表补值
+                    row = conn.execute(
+                        "SELECT status FROM revisions "
+                        "WHERE copy_id=? AND revision=?",
+                        (copy_id, revision)).fetchone()
+                    if row is None:
+                        raise RevisionNotFound(copy_id, revision)
+                    rows = conn.execute(
+                        "SELECT ann_id, start, end, label, holder "
+                        "FROM revision_annotations "
+                        "WHERE copy_id=? AND revision=?",
+                        (copy_id, revision)).fetchall()
+                    annotations = [
+                        {"id": ann_id, "start": start, "end": end,
+                         "label": label, "holder": holder}
+                        for ann_id, start, end, label, holder in rows]
+                    return {"revision": revision, "status": row[0],
+                            "annotations": annotations}
+
+                from_snap = load(from_revision)
+                to_snap = load(to_revision)
+                changes = diff_annotations(from_snap, to_snap)
+                return {
+                    "id": copy_id,
+                    "from_revision": from_revision,
+                    "to_revision": to_revision,
+                    "statuses": {"from": from_snap["status"],
+                                 "to": to_snap["status"]},
+                    "changes": changes,
+                }
             finally:
                 conn.close()

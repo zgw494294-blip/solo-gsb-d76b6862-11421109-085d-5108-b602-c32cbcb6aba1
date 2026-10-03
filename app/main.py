@@ -210,7 +210,7 @@ def _nonempty_str(v):
 # 在 pydantic 强转前校验：bool 会被默认当作 int，需先行拒绝
 StrictInt = Annotated[int, BeforeValidator(_reject_bool)]
 NonEmptyStr = Annotated[str, BeforeValidator(_nonempty_str)]
-# 结稿用的期望版本号：正整数（布尔不是合法版本号）
+# 正整数版本号：结稿的期望版本号与版本比较的 from/to（布尔不是合法版本号）
 PositiveInt = Annotated[int, BeforeValidator(_reject_bool), Field(gt=0)]
 
 
@@ -522,6 +522,24 @@ def list_copy_revisions(copy_id: str):
         "id": copy_id,
         "revisions": get_store().list_revisions(copy_id),
     })
+
+
+@app.get("/api/copies/{copy_id}/revisions/diff")
+def diff_copy_revisions(
+    copy_id: str,
+    from_revision: PositiveInt,
+    to_revision: PositiveInt,
+):
+    """比较两个已记录版本间的批注改动（只读已存快照，不改副本与历史）。
+
+    from_revision / to_revision 为正整数查询参数（布尔、非整数、非正数均
+    422）；允许倒序、允许相同，旧值 / 新值方向按入参 from → to 确定。
+    未知副本或任一未记录版本 404（旧库仅有 baseline 时不推测缺失历史）。
+    必须先于 ``/revisions/{revision}`` 注册，使字面段 ``diff`` 不被当作
+    版本号匹配。
+    """
+    return _copy_snapshot(lambda: get_store().diff_revisions(
+        copy_id, from_revision, to_revision))
 
 
 @app.get("/api/copies/{copy_id}/revisions/{revision}")

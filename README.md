@@ -238,6 +238,20 @@
   旧库启动时只为**没有任何历史记录**的副本补一条当前 `revision` 的
   `baseline` 快照（不编造早期历史、不改原数据，重复启动不重复补记），
   历史随原卷跨重启保留。
+- **版本间改动比较**：`GET /api/copies/{id}/revisions/diff?from_revision=
+  {from}&to_revision={to}` 直接列出两个**已记录版本**之间的批注改动（纯
+  HTTP，无前端页面）。两个版本号均为**正整数查询参数**（**布尔值不是
+  合法版本号**，缺失、非整数或非正数返回 **422**），**允许倒序、允许相同**，
+  旧值 / 新值方向按入参 `from → to` 确定。比较按批注的**完整字符串 id
+  对齐**（不按数组位置配对；空串、`/`、换行 id 原样参与、不改写），逐条
+  比较 `start`、`end`、`label`、`holder` 四个字段，**仅返回至少一个字段
+  发生变化的批注**：每条附四字段各自的旧值 / 新值与 `changed_fields`
+  变化字段名，结果按 id 的 **Unicode 码点序**排列；**纯顺序变化不算
+  改动**。另返回两端 `status`（`statuses.from` / `statuses.to`）——
+  **结稿只翻 status、批注未变时清单为空**，**相同版本比较同样返回空
+  清单**。未知副本或任一版本未记录返回 **404**（旧库仅有 baseline 时
+  **不推测缺失历史**）。比较**只读已存快照**：不读取当前状态补值、不改
+  副本或历史；现有路由、响应与原序回看均保持不变。
 - **读取**：`GET` 返回**同一提交状态**下的固定文本、`status`（`open` /
   `finalized`）、全部批注（含 `holder`，未持有为 `null`）、按稳定顺序排列的
   连通组（每组附 `holder`）与 `revision`。读取到的批注可**直接用于原审阅接口**
@@ -260,6 +274,7 @@ SQLite 数据库在容器内位于 `/data/copies.db`（`docker-compose.yml` 的�
 | POST | `/api/copies/{id}/finalize` | 入参 `{expected_revision}`（正整数，布尔 **422**），版本一致且无持有者时结稿为 `finalized`（`revision += 1`，其余不变），返回该次提交完整快照；版本过期 / 仍有持有者 / 已结稿 **409**，未知副本 **404**；结稿后领取 / 释放 / 修改均 **409**，不提供重开 |
 | GET | `/api/copies/{id}/revisions` | 按 `revision` 升序列出已记录版本的操作信息 `{id, revisions:[{revision,op,reviewer}]}`（`op` 为 `create` / `claim` / `release` / `modify` / `finalize` / `baseline`，创建 / 结稿 / 基线的 `reviewer` 为 `null`）；未知副本 **404** |
 | GET | `/api/copies/{id}/revisions/{revision}` | 读取该版本的完整快照 `{id,text,revision,status,op,reviewer,annotations,groups}`（只读，不改变当前状态；`annotations` 按该版保存的原序即创建顺序返回，当前副本响应仍按 `(start,end,label,id)` 排序）；未知副本或未记录版本 **404** |
+| GET | `/api/copies/{id}/revisions/diff?from_revision={from}&to_revision={to}` | 比较两个**已记录版本**间的批注改动（只读已存快照，不改副本 / 历史；允许倒序与相同版本，旧值 / 新值方向按入参确定）：返回 `{id, from_revision, to_revision, statuses:{from,to}, changes:[{id, changed_fields, start:{old,new}, end:{old,new}, label:{old,new}, holder:{old,new}}]}`；按完整字符串 id 对齐（不按数组位置，空串 / `/` / 换行 id 不改写），仅返回 `start` / `end` / `label` / `holder` 变化的批注、按 id 的 Unicode 码点序排列（纯顺序变化不算改动），结稿只翻 status 或相同版本时 `changes` 为空；版本号须为正整数（布尔 / 非整数 / 非正数 / 缺失 **422**），未知副本或任一未记录版本 **404**（旧库仅有 baseline 时不推测缺失历史） |
 
 ```bash
 # 创建工作副本：a 与 b 正长度重叠同组；b 与 c 相接不连边；d 独立
@@ -382,6 +397,59 @@ curl -s http://localhost:8000/api/copies/$OID/revisions/3 \
   | python3 -c 'import json,sys; s=json.load(sys.stdin); print(s["op"], s["reviewer"], [(a["id"], a["start"], a["end"], a["label"], a["holder"]) for a in s["annotations"]])'
 # → modify alice [('z', 4, 6, '丁改', 'alice'), ('a', 0, 3, '甲', None),
 #   ('m', 8, 10, '丙', None)]
+```
+
+### 两个已记录版本间的改动比较
+
+`GET /api/copies/{id}/revisions/diff` 直接列出两个**已记录版本**间的批注
+改动：`from_revision` / `to_revision` 为正整数查询参数（允许倒序、相同；
+布尔、非整数、非正数或缺失返回 **422**），按批注**完整字符串 id** 对齐
+（不按数组位置配对），只返回 `start` / `end` / `label` / `holder` 变化的
+批注并附四字段旧值 / 新值与变化字段名，按 id 的 Unicode 码点序排列（纯
+顺序变化不算改动）；另返回两端 status。比较只读已存快照，不改副本或历史，
+未知副本或未记录版本 **404**（旧库仅有 baseline 时不推测缺失历史）。
+
+```bash
+# 沿用上面 $CID 副本：rev1 创建 → 领取 / 释放 / 修改 → rev6 全释放 → rev7 结稿
+# 正向比较 1 → 4：旧值/新值方向为 from → to；只列出发生变化的批注（码点序）
+curl -s "http://localhost:8000/api/copies/$CID/revisions/diff?from_revision=1&to_revision=4" \
+  | python3 -m json.tool
+# → {"id": "...", "from_revision": 1, "to_revision": 4,
+#    "statuses": {"from": "open", "to": "open"},
+#    "changes": [
+#      {"id": "a", "changed_fields": ["holder"],
+#       "start": {"old": 0, "new": 0}, "end": {"old": 4, "new": 4},
+#       "label": {"old": "甲", "new": "甲"},
+#       "holder": {"old": null, "new": "alice"}},
+#      {"id": "b", ..., "holder": {"old": null, "new": "alice"}},
+#      {"id": "c", "changed_fields": ["start", "label", "holder"],
+#       "start": {"old": 12, "new": 13}, ...,
+#       "label": {"old": "丙", "new": "丙改"},
+#       "holder": {"old": null, "new": "bob"}}]}
+
+# 反向比较 4 → 1：允许倒序，旧值/新值方向随之对调
+curl -s "http://localhost:8000/api/copies/$CID/revisions/diff?from_revision=4&to_revision=1" \
+  | python3 -c 'import json,sys; d=json.load(sys.stdin); c={x["id"]:x for x in d["changes"]}; print(c["c"]["start"], c["a"]["holder"])'
+# → {"old": 13, "new": 12} {"old": "alice", "new": null}
+
+# 相同版本比较：清单为空，两端 status 相同
+curl -s "http://localhost:8000/api/copies/$CID/revisions/diff?from_revision=3&to_revision=3"
+# → {"id": "...", "from_revision": 3, "to_revision": 3,
+#    "statuses": {"from": "open", "to": "open"}, "changes": []}
+
+# 仅结稿变化（6 → 7）：批注未变，清单为空，但两端 status 都返回
+curl -s "http://localhost:8000/api/copies/$CID/revisions/diff?from_revision=6&to_revision=7"
+# → {"id": "...", "from_revision": 6, "to_revision": 7,
+#    "statuses": {"from": "open", "to": "finalized"}, "changes": []}
+
+# 非法版本参数 → 422；布尔值不是合法版本号
+curl -s -o /dev/null -w '%{http_code}\n' \
+  "http://localhost:8000/api/copies/$CID/revisions/diff?from_revision=0&to_revision=1"   # 422
+curl -s -o /dev/null -w '%{http_code}\n' \
+  "http://localhost:8000/api/copies/$CID/revisions/diff?from_revision=true&to_revision=1"  # 422
+# 任一版本未记录（旧库仅有 baseline 时不推测缺失历史）/ 未知副本 → 404
+curl -s -o /dev/null -w '%{http_code}\n' \
+  "http://localhost:8000/api/copies/$CID/revisions/diff?from_revision=1&to_revision=99"  # 404
 ```
 
 ### 特殊批注 id（空串、含 `/`、字面 `%2F` 与换行）的可执行调用
@@ -832,6 +900,7 @@ JSON」得到：
 | POST | `/api/copies/{id}/finalize` | 入参 `{expected_revision}`（正整数，布尔 / 非正数 **422**），把副本结稿为不可再改的定稿：仅 `status` 由 `open` 变 `finalized`、`revision += 1`，返回该次提交完整快照（文本、批注、持有权与排序不变）；版本过期 / 仍有持有者 / 已结稿 **409**（失败不改任何状态），未知副本 **404**；结稿后有效的领取 / 释放 / 修改均 **409**，不提供重开；结稿与其他变更并发等价于某个先后次序 |
 | GET | `/api/copies/{id}/revisions` | 历史回看：按 `revision` 升序列出已记录版本 `{id, revisions:[{revision,op,reviewer}]}`（`op` 为 `create` / `claim` / `release` / `modify` / `finalize` / `baseline`；创建 / 结稿 / 基线的 `reviewer` 为 `null`）；幂等领取与失败请求不产生记录；未知副本 **404** |
 | GET | `/api/copies/{id}/revisions/{revision}` | 读取该版本完整快照 `{id,text,revision,status,op,reviewer,annotations:[{id,start,end,label,holder}],groups}`（只读，不改变当前状态；快照与副本变更同事务提交，不混入后续版本；`annotations` 按该版保存的原序即创建顺序返回，已存历史与 baseline 同样适用、不回写历史数据）；未知副本或未记录版本 **404** |
+| GET | `/api/copies/{id}/revisions/diff?from_revision={from}&to_revision={to}` | 比较两个已记录版本间的批注改动（只读已存快照，不改副本 / 历史；允许倒序与相同版本，旧值 / 新值方向按入参 from → to 确定）：返回 `{id,from_revision,to_revision,statuses:{from,to},changes:[{id,changed_fields,start:{old,new},end:{old,new},label:{old,new},holder:{old,new}}]}`；按完整字符串 id 对齐（不按数组位置配对；空串、`/`、换行 id 原样参与），仅返回 start/end/label/holder 变化的批注、按 id 的 Unicode 码点序排列，纯顺序变化不算改动；结稿只翻 status（批注未变）或相同版本比较时 `changes` 为空；版本号须为正整数（布尔 / 非整数 / 非正数 / 缺失 **422**），未知副本或任一未记录版本 **404**（旧库仅有 baseline 时不推测缺失历史） |
 
 迁移导出条目状态取值：`shifted` / `matched` / `disambiguated` / `manual` / `abandoned`（废弃项 `start`、`end` 为 `null`）。
 
@@ -1008,7 +1077,7 @@ app/
   review.py          # 审阅切片核心：顺序装箱、窗口均分与边界余量转移、JSONL 导出、审阅结果校验回导
   relabel.py         # 标签体系迁移核心：规则集校验（目标标签 / 正则 / 回退约束）、迁移链求值（循环与缺规则检测）、导出重算
   redaction.py       # 遮盖导出核心：命中区间重叠/相接合并、[遮盖] 替换、可见片段拆分与新码点坐标换算
-  copies.py          # 可领取审阅工作副本：正长度重叠传递分组（相接不连边）、整组领取/释放、持有者改单条后重算分组、乐观版本结稿（open→finalized，不可重开），SQLite 持久化（进程锁串行化，旧库自动补 status 列，重启保留）；版本历史快照与副本变更同事务提交（创建/领取/释放/修改/结稿各记一条完整快照，旧副本仅补当前 revision 的 baseline，只读回看，回看批注按该版保存的原序返回）
+  copies.py          # 可领取审阅工作副本：正长度重叠传递分组（相接不连边）、整组领取/释放、持有者改单条后重算分组、乐观版本结稿（open→finalized，不可重开），SQLite 持久化（进程锁串行化，旧库自动补 status 列，重启保留）；版本历史快照与副本变更同事务提交（创建/领取/释放/修改/结稿各记一条完整快照，旧副本仅补当前 revision 的 baseline，只读回看，回看批注按该版保存的原序返回）；两已记录版本间按完整字符串 id 对齐的四字段改动比较（只读已存快照，允许倒序/相同，码点序，顺序变化不算改动）
   static/            # 原生 HTML/CSS/JS 前端（index.html 迁移页、arbitrate.html 仲裁页、sequence.html 序列标注页、nesting.html 嵌套审计页、units.html 制式转换页、review.html 审阅切片页、relabel.html 标签体系迁移页）
 tests/
   test_migration.py
@@ -1024,6 +1093,7 @@ tests/
   test_copy_api.py
   test_copy_finalize.py      # 结稿：HTTP / 持久化 / 旧库迁移 / 并发先后次序
   test_copy_history.py       # 历史回看：版本快照记录、同事务提交、baseline 补记与 HTTP 接口
+  test_copy_diff.py          # 版本间改动比较：id 对齐（含空串/斜杠/换行）、四字段差异、码点序、倒序/同版/仅结稿、404/422、baseline 不推测、只读
   test_copy_special_ids_http.py  # 空串 / 含"/" / 字面"%2F" / 含换行 特殊 id 的真实 HTTP（uvicorn）全流程回归
   test_validation.py
 Dockerfile
