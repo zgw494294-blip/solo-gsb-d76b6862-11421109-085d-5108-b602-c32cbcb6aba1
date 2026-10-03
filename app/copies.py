@@ -43,6 +43,16 @@ label），初始**无人持有**。
 `get_revision` 的批注按**该版保存的原序**（`pos`，即创建顺序）返回——
 已存历史与旧库 baseline 同样适用，且只改读取、不回写历史数据；当前副本
 的创建 / 读取 / 变更响应仍按 (start, end, label, id) 稳定排序。
+
+**版本间改动比较（`diff_annotation_snapshots` / `diff_revisions`）**：
+比较**两个已记录版本**的快照（只读已存快照，不读取当前状态补值、不改副本
+与历史）。两版批注按**完整字符串 id 对齐**（不按数组位置配对，空串、斜杠、
+换行等任意 id 原样参与），逐条比较 `start`、`end`、`label`、`holder`
+四个字段；**仅顺序变化不算改动**。结果只包含四个字段中至少一个发生变化的
+批注，每条附四个字段各自的旧值 / 新值（方向由入参 `from_revision` →
+`to_revision` 确定，允许倒序与相同版本，倒序时旧值仍取 from 端）与变化
+字段名，并按 id 的 **Unicode 码点序**排列。另返回两端 `status`；结稿只改
+`status`、批注四字段未变时清单为空，同版比较清单同样为空。
 """
 
 from __future__ import annotations
@@ -225,6 +235,47 @@ def connected_groups(annotations: list[dict]) -> list[list[str]]:
         groups.setdefault(find(i), []).append(a["id"])
     # find 根取最小下标，即组内最早成员，按首次出现顺序输出天然有序
     return [groups[k] for k in sorted(groups)]
+
+
+# ---------- 版本间改动比较（只读已存快照） ----------
+
+# 参与比较的四个批注字段及其在结果中的键名固定顺序
+_DIFF_FIELDS: tuple[str, ...] = ("start", "end", "label", "holder")
+
+
+def diff_annotation_snapshots(from_snap: dict, to_snap: dict) -> list[dict]:
+    """比较两个**已记录版本快照**的批注四字段改动（纯函数，不触碰存储）。
+
+    对齐方式：按批注的**完整字符串 id** 建索引对齐，**不按数组位置配对**；
+    id 原样使用（空串、含 "/"、含换行均不改写）。比较 ``start``、``end``、
+    ``label``、``holder`` 四个字段，**仅批注顺序变化不算改动**。
+
+    返回只包含四字段中至少一个发生变化的批注：每条附 ``id``、四个字段各自
+    的 ``from`` / ``to`` 旧值新值（方向固定为入参的 from 快照 → to 快照；
+    调用方允许倒序传参，倒序时旧值仍取自 from 端）、``changed_fields``
+    （按 start、end、label、holder 顺序列出实际变化字段名）。清单按 id 的
+    **Unicode 码点序**（Python str 默认序）排列。同一快照自比时清单为空。
+    某 id 只出现在一端时，缺失端四字段一律为 ``None``（当前系统不增删
+    批注，正常历史不会出现；不读取当前状态补值）。
+    """
+    from_anns = {a["id"]: a for a in from_snap["annotations"]}
+    to_anns = {a["id"]: a for a in to_snap["annotations"]}
+    changes: list[dict] = []
+    for ann_id in sorted(set(from_anns) | set(to_anns)):
+        old = from_anns.get(ann_id)
+        new = to_anns.get(ann_id)
+        changed = [f for f in _DIFF_FIELDS
+                   if (old or {}).get(f) != (new or {}).get(f)]
+        if not changed:
+            continue  # 仅顺序变化 / 四字段全同：不算改动
+        entry = {"id": ann_id, "changed_fields": changed}
+        for f in _DIFF_FIELDS:
+            entry[f] = {
+                "from": None if old is None else old.get(f),
+                "to": None if new is None else new.get(f),
+            }
+        changes.append(entry)
+    return changes
 
 
 # ---------- 纯内存核心 ----------
@@ -693,3 +744,29 @@ class CopyStore:
                 return snap
             finally:
                 conn.close()
+
+    def diff_revisions(self, copy_id: str,
+                       from_revision: int, to_revision: int) -> dict:
+        """比较两个**已记录版本**快照之间的批注改动（只读，不改变任何状态）。
+
+        两端快照均来自历史表（``get_revision``）：**只读已存快照，不读取
+        当前状态补值**，未知副本抛 ``CopyNotFound``、任一端版本未记录抛
+        ``RevisionNotFound``（均对应 HTTP 404）。旧库仅有 baseline 时，
+        未记录的早期版本同样 404，不推测缺失历史。方向完全由入参确定：
+        允许倒序（``from_revision > to_revision``）与相同版本
+        （清单为空）。结稿只改 ``status``、批注四字段未变时清单为空。
+
+        返回 ``{id, from_revision, to_revision, from_status, to_status,
+        changes}``；``changes`` 见 :func:`diff_annotation_snapshots`。
+        """
+        with self._lock:
+            from_snap = self.get_revision(copy_id, from_revision)
+            to_snap = self.get_revision(copy_id, to_revision)
+        return {
+            "id": copy_id,
+            "from_revision": from_revision,
+            "to_revision": to_revision,
+            "from_status": from_snap["status"],
+            "to_status": to_snap["status"],
+            "changes": diff_annotation_snapshots(from_snap, to_snap),
+        }

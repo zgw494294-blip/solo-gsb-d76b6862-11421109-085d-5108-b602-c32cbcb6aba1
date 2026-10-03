@@ -524,6 +524,20 @@ def list_copy_revisions(copy_id: str):
     })
 
 
+@app.get("/api/copies/{copy_id}/revisions/diff")
+def diff_copy_revisions(
+    copy_id: str,
+    # 两个已记录版本号：正整数（查询串里的 true/1.5/abc 等无法解析为整数），
+    # 布尔值不是合法版本号；允许相同版本与倒序，方向按 from → to 确定。
+    # 路由必须排在 {revision} 单版本回看之前，否则 "diff" 会被当成版本号。
+    from_revision: PositiveInt,
+    to_revision: PositiveInt,
+):
+    """比较两个已记录版本之间的批注改动（只读已存快照，不改副本与历史）。"""
+    return _copy_snapshot(
+        lambda: get_store().diff_revisions(copy_id, from_revision, to_revision))
+
+
 @app.get("/api/copies/{copy_id}/revisions/{revision}")
 def read_copy_revision(copy_id: str, revision: int):
     """读取指定版本的完整快照（只读，不改变当前状态）。"""

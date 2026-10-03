@@ -416,3 +416,64 @@ def test_newline_id_unknown_404(client):
     snap = client.get(f"/api/copies/{cid}").json()
     assert snap["revision"] == 1
     assert _holders(snap) == {"a": None}
+
+
+# ---------- 版本间改动比较：特殊 id 原样对齐、不改写（真实 HTTP） ----------
+
+def test_revision_diff_preserves_special_ids(client):
+    # 空串 / 斜杠 / 字面 %2F / 换行 id 各一条，区间留空隙互不重叠
+    special = ["", "审阅/1", "a%2Fb", "a\n"]
+    cid = _create(client, [ann(i, 4 * k, 4 * k + 2)
+                           for k, i in enumerate(special)])
+    for k, (ann_id, reviewer) in enumerate(zip(special, ["r0", "r1", "r2", "r3"])):
+        r = client.post(_url(cid, ann_id, "claim"),
+                        json={"reviewer": reviewer})
+        assert r.status_code == 200, r.text
+        r = client.patch(_url(cid, ann_id),
+                         json={"reviewer": reviewer, "start": 4 * k,
+                               "end": 4 * k + 1, "label": f"改{k}"})
+        assert r.status_code == 200, r.text
+    # 共 1（创建）+ 8 次变更 = 9 个版本
+    r = client.get(f"/api/copies/{cid}/revisions/diff",
+                   params={"from_revision": 1, "to_revision": 9})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    ids = [c["id"] for c in body["changes"]]
+    assert ids == sorted(special)  # 按 id 的 Unicode 码点序
+    by_id = {c["id"]: c for c in body["changes"]}
+    assert by_id[""]["changed_fields"] == ["end", "label", "holder"]
+    assert by_id[""]["label"] == {"from": "L", "to": "改0"}
+    assert by_id["审阅/1"]["label"] == {"from": "L", "to": "改1"}
+    assert by_id["a%2Fb"]["label"] == {"from": "L", "to": "改2"}
+    assert by_id["a\n"]["holder"] == {"from": None, "to": "r3"}
+
+    # 倒序：旧值 / 新值方向按入参翻转，清单同样按 id 码点序
+    r = client.get(f"/api/copies/{cid}/revisions/diff",
+                   params={"from_revision": 9, "to_revision": 1})
+    assert r.status_code == 200
+    rev = r.json()
+    assert [c["id"] for c in rev["changes"]] == sorted(special)
+    rev_by_id = {c["id"]: c for c in rev["changes"]}
+    assert rev_by_id["审阅/1"]["label"] == {"from": "改1", "to": "L"}
+    assert rev_by_id["a%2Fb"]["holder"] == {"from": "r2", "to": None}
+
+    # 同版比较 → 空清单；非法版本号 / 布尔 → 422；未记录版本 → 404
+    same = client.get(f"/api/copies/{cid}/revisions/diff",
+                      params={"from_revision": 3, "to_revision": 3})
+    assert same.status_code == 200 and same.json()["changes"] == []
+    assert client.get(f"/api/copies/{cid}/revisions/diff",
+                      params={"from_revision": 0, "to_revision": 1}
+                      ).status_code == 422
+    assert client.get(f"/api/copies/{cid}/revisions/diff",
+                      params={"from_revision": True, "to_revision": 1}
+                      ).status_code == 422
+    assert client.get(f"/api/copies/{cid}/revisions/diff",
+                      params={"from_revision": 1, "to_revision": 99}
+                      ).status_code == 404
+    assert client.get("/api/copies/deadbeef/revisions/diff",
+                      params={"from_revision": 1, "to_revision": 2}
+                      ).status_code == 404
+
+    # 只读：副本与历史均不被比较改变
+    snap = client.get(f"/api/copies/{cid}").json()
+    assert snap["revision"] == 9
